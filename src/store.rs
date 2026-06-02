@@ -836,8 +836,10 @@ fn process_is_alive(pid: i64) -> bool {
 fn process_is_alive(pid: i64) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE,
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+
+    const STILL_ACTIVE: u32 = 259;
 
     if pid <= 0 || pid > u32::MAX as i64 {
         return false;
