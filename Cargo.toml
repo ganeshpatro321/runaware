@@ -2,6 +2,14 @@
 name = "runaware"
 version = "0.1.0"
 edition = "2024"
+description = "Local runtime awareness for AI coding agents"
+license = "MIT"
+repository = "https://github.com/ganeshpatro321/runaware"
+homepage = "https://github.com/ganeshpatro321/runaware"
+readme = "README.md"
+keywords = ["ai", "mcp", "debugging", "logs", "cli"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+authors = ["Ganesh Patro <ganeshpatro321@gmail.com>"]
 
 [dependencies]
 anyhow = "1.0.102"

@@ -21,6 +21,10 @@ developer runs local services
 
 RunAware is not a production observability platform. It is local runtime context for AI-assisted development.
 
+## Project Status
+
+RunAware is early-stage software. The core CLI, shell capture, active-run runtime model, and MCP server are usable, but APIs and storage behavior may change before 1.0.
+
 ## Current Features
 
 - Runtime source tracking for services such as `frontend`, `api`, `worker`, and `tests`
@@ -55,7 +59,102 @@ Source status values:
 - `stale`: latest captured run did not write an exit timestamp, but its PID is dead
 - `unknown`: older captured run does not have PID metadata
 
-## Requirements
+## Install
+
+### Homebrew
+
+The first Homebrew install path will be a project tap:
+
+```bash
+brew install ganeshpatro321/tap/runaware
+```
+
+Plain `brew install runaware` is the goal, but it only works after RunAware is accepted into Homebrew core. Until then, Homebrew requires the tap-qualified command above.
+
+### macOS and Linux Install Script
+
+After a GitHub release is published, macOS and Linux users can install the latest binary without installing Rust:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ganeshpatro321/runaware/main/scripts/install.sh | sh
+```
+
+The script installs `runaware` to:
+
+```text
+~/.local/bin/runaware
+```
+
+Install a specific version:
+
+```bash
+RUNAWARE_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/ganeshpatro321/runaware/main/scripts/install.sh | sh
+```
+
+Install somewhere else:
+
+```bash
+RUNAWARE_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/ganeshpatro321/runaware/main/scripts/install.sh | sh
+```
+
+### Windows PowerShell Install Script
+
+After a GitHub release is published, Windows users can install without Rust:
+
+```powershell
+irm https://raw.githubusercontent.com/ganeshpatro321/runaware/main/scripts/install.ps1 | iex
+```
+
+The script installs `runaware.exe` to:
+
+```text
+%USERPROFILE%\.runaware\bin\runaware.exe
+```
+
+Add that directory to `PATH` if needed.
+
+PowerShell shell-profile integration is not implemented yet. On Windows, use explicit capture for now:
+
+```powershell
+runaware capture --source api -- pnpm run dev
+```
+
+### Direct Binary Downloads
+
+GitHub Releases publish prebuilt archives:
+
+```text
+runaware-aarch64-apple-darwin.tar.gz
+runaware-x86_64-apple-darwin.tar.gz
+runaware-x86_64-unknown-linux-gnu.tar.gz
+runaware-x86_64-pc-windows-msvc.zip
+```
+
+Each archive includes the `runaware` binary and README. Release assets also include `.sha256` checksum files.
+
+### Install From Source
+
+Developers can install from source with Cargo:
+
+```bash
+git clone git@github.com:ganeshpatro321/runaware.git
+cd runaware
+cargo install --path .
+```
+
+Cargo installs the binary to:
+
+```text
+~/.cargo/bin/runaware
+```
+
+Check the installation:
+
+```bash
+runaware doctor
+```
+
+## Requirements For Source Builds
 
 - Rust toolchain with Cargo
 - macOS or Linux-like environment
@@ -72,39 +171,6 @@ Check Rust:
 ```bash
 rustc --version
 cargo --version
-```
-
-## Install From Source
-
-Clone the repo:
-
-```bash
-git clone git@github.com:ganeshpatro321/runaware.git
-cd runaware
-```
-
-Install the binary:
-
-```bash
-cargo install --path .
-```
-
-Cargo installs the binary to:
-
-```text
-~/.cargo/bin/runaware
-```
-
-Make sure that directory is on your `PATH`:
-
-```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-```
-
-Check the installation:
-
-```bash
-runaware doctor
 ```
 
 ## Development Build
@@ -398,6 +464,31 @@ Current redaction covers common forms of:
 
 Treat this as a safety layer, not a perfect DLP system.
 
+## Contributing
+
+Contributions are welcome. Start with:
+
+```bash
+cargo fmt --check
+cargo test --locked
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, project principles, and good first contribution areas.
+
+## Security
+
+Please do not report security vulnerabilities in public issues.
+
+See [SECURITY.md](SECURITY.md) for the security policy and private reporting instructions.
+
+## Code of Conduct
+
+This project has a [Code of Conduct](CODE_OF_CONDUCT.md). Participation in project spaces means agreeing to follow it.
+
+## License
+
+RunAware is licensed under the [MIT License](LICENSE).
+
 ## Troubleshooting
 
 ### My service is running, but RunAware does not show it as active
@@ -474,3 +565,47 @@ sqlite3 ~/.runaware/runaware.db
 - Stronger cross-service correlation
 - More robust MCP protocol behavior
 - Optional UI/dashboard
+
+## Maintainer Release Process
+
+Run tests:
+
+```bash
+cargo test --locked
+```
+
+Create and push a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds:
+
+```text
+macOS Apple Silicon
+macOS Intel
+Linux x86_64
+Windows x86_64
+```
+
+and uploads archives plus `.sha256` checksum files to GitHub Releases.
+
+For Homebrew, publish the formula from:
+
+```text
+packaging/homebrew/Formula/runaware.rb
+```
+
+to a tap repository such as:
+
+```text
+github.com/ganeshpatro321/homebrew-tap
+```
+
+Replace the formula's checksum placeholders with the release checksum values, then users can install with:
+
+```bash
+brew install ganeshpatro321/tap/runaware
+```

@@ -1,0 +1,62 @@
+name: Bug Report
+description: Report a reproducible problem with RunAware.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please redact secrets before pasting logs.
+  - type: input
+    id: version
+    attributes:
+      label: RunAware version
+      description: Output of `runaware --version`.
+      placeholder: runaware 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      placeholder: zsh, bash, fish, PowerShell, etc.
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Include the command you ran and whether shell integration or explicit capture was used.
+      placeholder: |
+        1. Run ...
+        2. Run ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste redacted output from `runaware doctor`, `runaware sources --json`, or relevant commands.
+      render: text
