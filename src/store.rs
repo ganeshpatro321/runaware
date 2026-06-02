@@ -818,6 +818,7 @@ fn status_for_run(ended_at: Option<&str>, pid: Option<i64>) -> &'static str {
     }
 }
 
+#[cfg(unix)]
 fn process_is_alive(pid: i64) -> bool {
     if pid <= 0 || pid > i32::MAX as i64 {
         return false;
@@ -829,6 +830,31 @@ fn process_is_alive(pid: i64) -> bool {
     }
 
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: i64) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE,
+    };
+
+    if pid <= 0 || pid > u32::MAX as i64 {
+        return false;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle.is_null() {
+            return false;
+        }
+
+        let mut exit_code = 0_u32;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        let _ = CloseHandle(handle);
+
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
 }
 
 #[cfg(test)]
