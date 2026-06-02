@@ -404,6 +404,44 @@ Use RunAware to summarize active runtime errors.
 Check RunAware for errors in db-api-server.
 ```
 
+### Claude Code
+
+Add RunAware to Claude Code as a stdio MCP server:
+
+```bash
+claude mcp add runaware -- "$(command -v runaware)" mcp
+```
+
+If `runaware` is installed somewhere that is not on `PATH`, pass the absolute binary path instead:
+
+```bash
+claude mcp add runaware -- /Users/you/.cargo/bin/runaware mcp
+```
+
+You can also add it from JSON:
+
+```bash
+claude mcp add-json runaware '{"type":"stdio","command":"/Users/you/.cargo/bin/runaware","args":["mcp"]}'
+```
+
+Verify the server is registered:
+
+```bash
+claude mcp list
+claude mcp get runaware
+```
+
+Start a new Claude Code session after adding the server. Inside Claude Code, use `/mcp` to inspect MCP connection status and available tools.
+
+Example prompts:
+
+```text
+Use RunAware to list active runtime sources.
+Use RunAware to summarize active runtime errors.
+Check RunAware for backend errors from the last 10 minutes.
+Create a RunAware checkpoint called before fix.
+```
+
 ### MCP Tools
 
 RunAware exposes these MCP tools:
