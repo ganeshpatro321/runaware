@@ -2,10 +2,14 @@ use crate::detect::{self, DetectedStart, Severity};
 use crate::redact;
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Debug)]
 struct OpenBlock {
@@ -74,6 +78,7 @@ fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String
     if let Some(pid) = child.process_id() {
         store.set_run_pid(run_id, pid)?;
     }
+    let interrupt = InterruptGuard::install(child.process_id(), true, child.clone_killer())?;
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader()?;
@@ -101,7 +106,11 @@ fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String
     flush_block(store, run_id, source, &mut block)?;
 
     let status = child.wait()?;
-    Ok(status.exit_code() as i32)
+    Ok(if interrupt.was_triggered() {
+        130
+    } else {
+        status.exit_code() as i32
+    })
 }
 
 fn capture_with_pipes(
@@ -117,6 +126,7 @@ fn capture_with_pipes(
         .spawn()
         .with_context(|| format!("failed to spawn '{}'", command.join(" ")))?;
     store.set_run_pid(run_id, child.id())?;
+    let interrupt = InterruptGuard::install(Some(child.id()), false, child.clone_killer())?;
 
     let mut block = None;
     if let Some(mut stdout) = child.stdout.take() {
@@ -127,8 +137,68 @@ fn capture_with_pipes(
     }
     flush_block(store, run_id, source, &mut block)?;
 
-    Ok(child.wait()?.code().unwrap_or(1))
+    let status = child.wait()?;
+    Ok(if interrupt.was_triggered() {
+        130
+    } else {
+        status.code().unwrap_or(1)
+    })
 }
+
+struct InterruptGuard {
+    triggered: Arc<AtomicBool>,
+}
+
+impl InterruptGuard {
+    fn install(
+        pid: Option<u32>,
+        terminate_process_group: bool,
+        killer: Box<dyn ChildKiller + Send + Sync>,
+    ) -> Result<Self> {
+        let triggered = Arc::new(AtomicBool::new(false));
+        let handler_triggered = Arc::clone(&triggered);
+        let killer = Arc::new(Mutex::new(killer));
+        let handler_killer = Arc::clone(&killer);
+
+        ctrlc::set_handler(move || {
+            handler_triggered.store(true, Ordering::SeqCst);
+
+            if terminate_process_group {
+                terminate_group(pid);
+            }
+
+            if let Ok(mut killer) = handler_killer.lock() {
+                let _ = killer.kill();
+            }
+        })
+        .context("failed to install interrupt handler")?;
+
+        Ok(Self { triggered })
+    }
+
+    fn was_triggered(&self) -> bool {
+        self.triggered.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+fn terminate_group(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    if pid > i32::MAX as u32 {
+        return;
+    }
+
+    unsafe {
+        let pgid = -(pid as i32);
+        let _ = libc::kill(pgid, libc::SIGINT);
+        let _ = libc::kill(pgid, libc::SIGHUP);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_group(_pid: Option<u32>) {}
 
 fn read_pipe(
     store: &Store,
