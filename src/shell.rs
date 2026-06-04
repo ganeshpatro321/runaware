@@ -17,12 +17,20 @@ const POSIX_SCRIPT: &str = r#"# RunAware shell integration
 __runaware_capture() {
   local __runaware_cmd="$1"
   shift
+  if [ -n "${RUNAWARE_CAPTURE_ACTIVE:-}" ]; then
+    command "$__runaware_cmd" "$@"
+    return $?
+  fi
   case "$1" in
     -v|--version|version|-h|--help|help)
       command "$__runaware_cmd" "$@"
       return $?
       ;;
   esac
+  if ! command -v runaware >/dev/null 2>&1; then
+    command "$__runaware_cmd" "$@"
+    return $?
+  fi
   command runaware capture --source auto -- "$__runaware_cmd" "$@"
 }
 
@@ -38,8 +46,16 @@ go() { __runaware_capture go "$@"; }
 cargo() { __runaware_capture cargo "$@"; }
 
 docker() {
+  if [ -n "${RUNAWARE_CAPTURE_ACTIVE:-}" ]; then
+    command docker "$@"
+    return $?
+  fi
   if [ "$1" = "compose" ] || [ "$1" = "logs" ]; then
-    RUNAWARE_SOURCE="${RUNAWARE_SOURCE:-docker}" command runaware capture --source auto -- docker "$@"
+    if command -v runaware >/dev/null 2>&1; then
+      RUNAWARE_SOURCE="${RUNAWARE_SOURCE:-docker}" command runaware capture --source auto -- docker "$@"
+    else
+      command docker "$@"
+    fi
   else
     command docker "$@"
   fi
@@ -54,10 +70,18 @@ const FISH_SCRIPT: &str = r#"# RunAware shell integration for fish
 function __runaware_capture
   set cmd $argv[1]
   set -e argv[1]
+  if set -q RUNAWARE_CAPTURE_ACTIVE
+    command $cmd $argv
+    return $status
+  end
   switch "$argv[1]"
     case -v --version version -h --help help
       command $cmd $argv
       return $status
+  end
+  if not command -q runaware
+    command $cmd $argv
+    return $status
   end
   command runaware capture --source auto -- $cmd $argv
 end
@@ -73,9 +97,17 @@ function pytest; __runaware_capture pytest $argv; end
 function go; __runaware_capture go $argv; end
 function cargo; __runaware_capture cargo $argv; end
 function docker
+  if set -q RUNAWARE_CAPTURE_ACTIVE
+    command docker $argv
+    return $status
+  end
   if test "$argv[1]" = "compose"; or test "$argv[1]" = "logs"
-    set -lx RUNAWARE_SOURCE docker
-    command runaware capture --source auto -- docker $argv
+    if command -q runaware
+      set -lx RUNAWARE_SOURCE docker
+      command runaware capture --source auto -- docker $argv
+    else
+      command docker $argv
+    end
   else
     command docker $argv
   end
@@ -85,3 +117,20 @@ function runaware-checkpoint
   command runaware checkpoint $argv
 end
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::init_script;
+    use crate::cli::ShellKind;
+
+    #[test]
+    fn shell_integration_skips_nested_capture() {
+        let zsh = init_script(ShellKind::Zsh);
+        assert!(zsh.contains("RUNAWARE_CAPTURE_ACTIVE"));
+        assert!(zsh.contains("command \"$__runaware_cmd\" \"$@\""));
+
+        let fish = init_script(ShellKind::Fish);
+        assert!(fish.contains("RUNAWARE_CAPTURE_ACTIVE"));
+        assert!(fish.contains("command $cmd $argv"));
+    }
+}

@@ -4,6 +4,16 @@ All notable changes to RunAware will be documented in this file.
 
 This project follows semantic versioning after the initial public release.
 
+## 0.1.2 - 2026-06-04
+
+- Forward terminal stdin to PTY-backed captured commands so interactive TUIs receive keypresses.
+- Size captured PTYs from the current terminal instead of using a fixed default.
+- Use pipe capture automatically when stdio is piped or redirected.
+- Drain captured stdout and stderr concurrently to avoid pipe deadlocks.
+- Forward terminal resize changes to PTY-backed captured commands on Unix.
+- Prevent nested shell integration captures inside already captured commands.
+- Run the original command without capture when RunAware storage is unavailable.
+
 ## 0.1.1 - 2026-06-03
 
 - Forward interrupts to captured processes so `Ctrl+C` frees server ports.

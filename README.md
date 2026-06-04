@@ -262,6 +262,7 @@ runaware capture --source tests -- cargo test
 ```
 
 RunAware mirrors the command output to your terminal while storing redacted runtime context locally.
+Interactive terminal commands use PTY capture. Commands whose stdin, stdout, or stderr is piped or redirected automatically use pipe capture so shell pipelines and redirects keep normal stream behavior.
 
 ## Source Naming
 

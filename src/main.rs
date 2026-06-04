@@ -15,7 +15,6 @@ use store::Store;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let store = Store::open_default()?;
 
     match cli.command {
         Commands::Capture {
@@ -23,6 +22,16 @@ fn main() -> Result<()> {
             command,
             no_pty,
         } => {
+            let store = match Store::open_default() {
+                Ok(store) => store,
+                Err(err) => {
+                    eprintln!(
+                        "RunAware capture unavailable: {err:#}. Running command without capture."
+                    );
+                    let code = capture::run_uncaptured(&command)?;
+                    std::process::exit(code);
+                }
+            };
             let code = capture::capture_command(&store, source, command, !no_pty)?;
             std::process::exit(code);
         }
@@ -36,6 +45,7 @@ fn main() -> Result<()> {
             stopped,
             json,
         } => {
+            let store = Store::open_default()?;
             let mut sources = store.list_sources()?;
             if active {
                 sources.retain(|source| source.active);
@@ -68,6 +78,7 @@ fn main() -> Result<()> {
             limit,
             json,
         } => {
+            let store = Store::open_default()?;
             let since = time::parse_since(&since)?;
             let logs = store.logs_since(since, source.as_deref(), limit, true)?;
             if json {
@@ -87,6 +98,7 @@ fn main() -> Result<()> {
             limit,
             json,
         } => {
+            let store = Store::open_default()?;
             let since = time::parse_since(&since)?;
             let errors = store.error_blocks_since(since, source.as_deref(), limit, true)?;
             if json {
@@ -108,6 +120,7 @@ fn main() -> Result<()> {
             since,
             json,
         } => {
+            let store = Store::open_default()?;
             let since = time::parse_since(&since)?;
             let report = summary::summarize(&store, since, source.as_deref(), true)?;
             if json {
@@ -123,6 +136,7 @@ fn main() -> Result<()> {
             limit,
             json,
         } => {
+            let store = Store::open_default()?;
             let since = time::parse_since(&since)?;
             let results = store.search_logs(&query, since, source.as_deref(), limit, true)?;
             if json {
@@ -142,6 +156,7 @@ fn main() -> Result<()> {
             limit,
             json,
         } => {
+            let store = Store::open_default()?;
             let events = store.logs_around_error(&error_id, seconds, limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&events)?);
@@ -158,6 +173,7 @@ fn main() -> Result<()> {
             source,
             checkpoints,
         } => {
+            let store = Store::open_default()?;
             if let Some(source) = source {
                 let removed = store.remove_source(&source)?;
                 println!("Removed source '{source}' and {removed} run(s).");
@@ -171,10 +187,12 @@ fn main() -> Result<()> {
             }
         }
         Commands::RemoveSource { source } => {
+            let store = Store::open_default()?;
             let removed = store.remove_source(&source)?;
             println!("Removed source '{source}' and {removed} run(s).");
         }
         Commands::Checkpoint { name, json } => {
+            let store = Store::open_default()?;
             let checkpoint = store.create_checkpoint(&name)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&checkpoint)?);
@@ -190,6 +208,7 @@ fn main() -> Result<()> {
             source,
             json,
         } => {
+            let store = Store::open_default()?;
             let checkpoint = store.find_checkpoint(&checkpoint)?;
             let since =
                 chrono::DateTime::parse_from_rfc3339(&checkpoint.ts)?.with_timezone(&chrono::Utc);
@@ -202,6 +221,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Mcp => {
+            let store = Store::open_default()?;
             mcp::serve_stdio(store)?;
         }
         Commands::Doctor => {

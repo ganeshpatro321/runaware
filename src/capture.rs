@@ -2,14 +2,19 @@ use crate::detect::{self, DetectedStart, Severity};
 use crate::redact;
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use portable_pty::MasterPty;
 use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug)]
 struct OpenBlock {
@@ -22,7 +27,7 @@ pub fn capture_command(
     store: &Store,
     requested_source: String,
     command: Vec<String>,
-    use_pty: bool,
+    prefer_pty: bool,
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("capture requires a command");
@@ -31,7 +36,14 @@ pub fn capture_command(
     let command_text = command.join(" ");
     let cwd = std::env::current_dir()?.display().to_string();
     let source = infer_source(&requested_source, &command, Path::new(&cwd));
-    let run_id = store.start_run(&source, &command_text, &cwd)?;
+    let run_id = match store.start_run(&source, &command_text, &cwd) {
+        Ok(run_id) => run_id,
+        Err(err) => {
+            eprintln!("RunAware capture unavailable: {err:#}. Running command without capture.");
+            return run_uncaptured(&command);
+        }
+    };
+    let use_pty = prefer_pty && stdio_is_interactive();
 
     let result = if use_pty {
         capture_with_pty(store, &run_id, &source, &command)
@@ -41,7 +53,9 @@ pub fn capture_command(
 
     match result {
         Ok(code) => {
-            store.finish_run(&run_id, code)?;
+            if let Err(err) = store.finish_run(&run_id, code) {
+                eprintln!("RunAware failed to finish captured run: {err:#}");
+            }
             Ok(code)
         }
         Err(err) => {
@@ -52,24 +66,44 @@ pub fn capture_command(
                 "RunAware capture failed",
                 &redact::redact(&err.to_string()),
             )?;
-            store.finish_run(&run_id, 1)?;
+            if let Err(finish_err) = store.finish_run(&run_id, 1) {
+                eprintln!("RunAware failed to finish failed captured run: {finish_err:#}");
+            }
             Err(err)
         }
     }
 }
 
+pub fn run_uncaptured(command: &[String]) -> Result<i32> {
+    if command.is_empty() {
+        bail!("capture requires a command");
+    }
+
+    let status = Command::new(&command[0])
+        .args(&command[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to spawn '{}'", command.join(" ")))?;
+
+    Ok(status.code().unwrap_or(1))
+}
+
+fn stdio_is_interactive() -> bool {
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+}
+
 fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String]) -> Result<i32> {
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows: 30,
-        cols: 120,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    let pair = pty_system.openpty(current_pty_size())?;
 
     let mut cmd = CommandBuilder::new(&command[0]);
     cmd.args(&command[1..]);
     cmd.cwd(std::env::current_dir()?);
+    cmd.env("RUNAWARE_CAPTURE_ACTIVE", "1");
 
     let mut child = pair
         .slave
@@ -81,6 +115,17 @@ fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String
     let interrupt = InterruptGuard::install(child.process_id(), true, child.clone_killer())?;
     drop(pair.slave);
 
+    let _terminal_mode = TerminalModeGuard::enable_for_capture()?;
+    let stdin_forwarder_done = Arc::new(AtomicBool::new(false));
+    let resize_forwarder_done = Arc::new(AtomicBool::new(false));
+    let _stdin_forwarder_guard = DoneGuard::new(Arc::clone(&stdin_forwarder_done));
+    let _resize_forwarder_guard = DoneGuard::new(Arc::clone(&resize_forwarder_done));
+    let _resize_forwarder =
+        spawn_resize_forwarder(pair.master.as_ref(), Arc::clone(&resize_forwarder_done));
+    let _stdin_forwarder = spawn_stdin_forwarder(
+        pair.master.take_writer()?,
+        Arc::clone(&stdin_forwarder_done),
+    );
     let mut reader = pair.master.try_clone_reader()?;
     let mut stdout = std::io::stdout();
     let mut buffer = [0_u8; 8192];
@@ -113,6 +158,248 @@ fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String
     })
 }
 
+struct DoneGuard {
+    done: Arc<AtomicBool>,
+}
+
+impl DoneGuard {
+    fn new(done: Arc<AtomicBool>) -> Self {
+        Self { done }
+    }
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
+fn spawn_stdin_forwarder(
+    mut writer: Box<dyn Write + Send>,
+    done: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || forward_stdin_to_pty(&mut writer, &done))
+}
+
+#[cfg(unix)]
+fn forward_stdin_to_pty(writer: &mut dyn Write, done: &AtomicBool) {
+    let mut buffer = [0_u8; 8192];
+
+    while !done.load(Ordering::SeqCst) {
+        let mut poll_fd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 100) };
+        if ready == 0 {
+            continue;
+        }
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if poll_fd.revents & libc::POLLNVAL != 0 {
+            break;
+        }
+        if poll_fd.revents & libc::POLLIN == 0 {
+            if poll_fd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                break;
+            }
+            continue;
+        }
+
+        let n = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if n == 0 {
+            break;
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+
+        let bytes = &buffer[..n as usize];
+        if writer.write_all(bytes).is_err() {
+            break;
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn forward_stdin_to_pty(writer: &mut dyn Write, done: &AtomicBool) {
+    let mut stdin = std::io::stdin();
+    let mut buffer = [0_u8; 8192];
+
+    while !done.load(Ordering::SeqCst) {
+        match stdin.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                if writer.write_all(&buffer[..n]).is_err() {
+                    break;
+                }
+                if writer.flush().is_err() {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn current_pty_size() -> PtySize {
+    current_terminal_size().unwrap_or(PtySize {
+        rows: 30,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+}
+
+#[cfg(unix)]
+fn current_terminal_size() -> Option<PtySize> {
+    for fd in [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO] {
+        let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+        let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, size.as_mut_ptr()) } == 0;
+        if !ok {
+            continue;
+        }
+
+        let size = unsafe { size.assume_init() };
+        if size.ws_row > 0 && size.ws_col > 0 {
+            return Some(PtySize {
+                rows: size.ws_row,
+                cols: size.ws_col,
+                pixel_width: size.ws_xpixel,
+                pixel_height: size.ws_ypixel,
+            });
+        }
+    }
+
+    None
+}
+
+#[cfg(not(unix))]
+fn current_terminal_size() -> Option<PtySize> {
+    None
+}
+
+#[cfg(unix)]
+fn spawn_resize_forwarder(
+    master: &dyn MasterPty,
+    done: Arc<AtomicBool>,
+) -> Option<thread::JoinHandle<()>> {
+    let fd = master.as_raw_fd()?;
+    Some(thread::spawn(move || {
+        let mut last_size = None;
+        while !done.load(Ordering::SeqCst) {
+            if let Some(size) = current_terminal_size()
+                && last_size != Some(size)
+            {
+                set_pty_size(fd, size);
+                last_size = Some(size);
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }))
+}
+
+#[cfg(not(unix))]
+fn spawn_resize_forwarder(
+    _master: &(dyn portable_pty::MasterPty + Send),
+    _done: Arc<AtomicBool>,
+) -> Option<thread::JoinHandle<()>> {
+    None
+}
+
+#[cfg(unix)]
+fn set_pty_size(fd: libc::c_int, size: PtySize) {
+    let window_size = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: size.pixel_width,
+        ws_ypixel: size.pixel_height,
+    };
+
+    unsafe {
+        let _ = libc::ioctl(fd, libc::TIOCSWINSZ, &window_size);
+    }
+}
+
+#[cfg(unix)]
+struct TerminalModeGuard {
+    fd: libc::c_int,
+    original: Option<libc::termios>,
+}
+
+#[cfg(unix)]
+impl TerminalModeGuard {
+    fn enable_for_capture() -> Result<Self> {
+        let fd = libc::STDIN_FILENO;
+        if unsafe { libc::isatty(fd) } != 1 {
+            return Ok(Self { fd, original: None });
+        }
+
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to read terminal mode before PTY capture");
+        }
+
+        let original = unsafe { original.assume_init() };
+        let mut raw = original;
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+        }
+
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to enable raw terminal mode for PTY capture");
+        }
+
+        Ok(Self {
+            fd,
+            original: Some(original),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if let Some(original) = &self.original {
+            unsafe {
+                let _ = libc::tcsetattr(self.fd, libc::TCSANOW, original);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct TerminalModeGuard;
+
+#[cfg(not(unix))]
+impl TerminalModeGuard {
+    fn enable_for_capture() -> Result<Self> {
+        Ok(Self)
+    }
+}
+
 fn capture_with_pipes(
     store: &Store,
     run_id: &str,
@@ -121,6 +408,8 @@ fn capture_with_pipes(
 ) -> Result<i32> {
     let mut child = Command::new(&command[0])
         .args(&command[1..])
+        .env("RUNAWARE_CAPTURE_ACTIVE", "1")
+        .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -128,12 +417,51 @@ fn capture_with_pipes(
     store.set_run_pid(run_id, child.id())?;
     let interrupt = InterruptGuard::install(Some(child.id()), false, child.clone_killer())?;
 
-    let mut block = None;
-    if let Some(mut stdout) = child.stdout.take() {
-        read_pipe(store, run_id, source, "stdout", &mut stdout, &mut block)?;
+    let (tx, rx) = mpsc::channel();
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_pipe_reader("stdout", stdout, tx.clone()));
     }
-    if let Some(mut stderr) = child.stderr.take() {
-        read_pipe(store, run_id, source, "stderr", &mut stderr, &mut block)?;
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_pipe_reader("stderr", stderr, tx.clone()));
+    }
+    drop(tx);
+
+    let mut block = None;
+    let mut stdout_partial = String::new();
+    let mut stderr_partial = String::new();
+    for event in rx {
+        match event {
+            PipeEvent::Chunk { stream, bytes } => {
+                process_pipe_chunk(
+                    store,
+                    run_id,
+                    source,
+                    stream,
+                    &bytes,
+                    if stream == "stderr" {
+                        &mut stderr_partial
+                    } else {
+                        &mut stdout_partial
+                    },
+                    &mut block,
+                )?;
+            }
+            PipeEvent::ReadError { stream, error } => {
+                bail!("failed to read {stream} from captured command: {error}");
+            }
+        }
+    }
+
+    for reader in readers {
+        reader.join().expect("pipe reader thread panicked");
+    }
+
+    if !stdout_partial.is_empty() {
+        process_line(store, run_id, source, "stdout", &stdout_partial, &mut block)?;
+    }
+    if !stderr_partial.is_empty() {
+        process_line(store, run_id, source, "stderr", &stderr_partial, &mut block)?;
     }
     flush_block(store, run_id, source, &mut block)?;
 
@@ -143,6 +471,72 @@ fn capture_with_pipes(
     } else {
         status.code().unwrap_or(1)
     })
+}
+
+enum PipeEvent {
+    Chunk {
+        stream: &'static str,
+        bytes: Vec<u8>,
+    },
+    ReadError {
+        stream: &'static str,
+        error: std::io::Error,
+    },
+}
+
+fn spawn_pipe_reader<R>(
+    stream: &'static str,
+    mut reader: R,
+    tx: mpsc::Sender<PipeEvent>,
+) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx
+                        .send(PipeEvent::Chunk {
+                            stream,
+                            bytes: buffer[..n].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    let _ = tx.send(PipeEvent::ReadError { stream, error });
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn process_pipe_chunk(
+    store: &Store,
+    run_id: &str,
+    source: &str,
+    stream: &str,
+    bytes: &[u8],
+    partial: &mut String,
+    block: &mut Option<OpenBlock>,
+) -> Result<()> {
+    if stream == "stderr" {
+        std::io::stderr().write_all(bytes)?;
+        std::io::stderr().flush()?;
+    } else {
+        std::io::stdout().write_all(bytes)?;
+        std::io::stdout().flush()?;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    partial.push_str(&text);
+    flush_complete_lines(store, run_id, source, stream, partial, block)
 }
 
 struct InterruptGuard {
@@ -199,38 +593,6 @@ fn terminate_group(pid: Option<u32>) {
 
 #[cfg(not(unix))]
 fn terminate_group(_pid: Option<u32>) {}
-
-fn read_pipe(
-    store: &Store,
-    run_id: &str,
-    source: &str,
-    stream: &str,
-    reader: &mut impl Read,
-    block: &mut Option<OpenBlock>,
-) -> Result<()> {
-    let mut buffer = [0_u8; 8192];
-    let mut partial = String::new();
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        if stream == "stderr" {
-            std::io::stderr().write_all(&buffer[..n])?;
-            std::io::stderr().flush()?;
-        } else {
-            std::io::stdout().write_all(&buffer[..n])?;
-            std::io::stdout().flush()?;
-        }
-        let text = String::from_utf8_lossy(&buffer[..n]);
-        partial.push_str(&text);
-        flush_complete_lines(store, run_id, source, stream, &mut partial, block)?;
-    }
-    if !partial.is_empty() {
-        process_line(store, run_id, source, stream, &partial, block)?;
-    }
-    Ok(())
-}
 
 fn flush_complete_lines(
     store: &Store,

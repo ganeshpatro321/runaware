@@ -17,7 +17,7 @@ pub enum Commands {
         #[arg(short, long, default_value = "auto")]
         source: String,
 
-        /// Use plain pipes instead of a pseudo-terminal.
+        /// Use plain pipes instead of automatic pseudo-terminal capture.
         #[arg(long)]
         no_pty: bool,
 
