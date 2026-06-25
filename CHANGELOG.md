@@ -4,6 +4,10 @@ All notable changes to RunAware will be documented in this file.
 
 This project follows semantic versioning after the initial public release.
 
+## 0.1.5 - 2026-06-25
+
+- Preserve nested capture shims through package-manager commands so Turbo child tasks can be captured.
+
 ## 0.1.4 - 2026-06-25
 
 - Capture Turbo-style child package commands through opt-in nested PATH shims.

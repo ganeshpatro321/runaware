@@ -778,7 +778,9 @@ fn prepare_nested_capture_shims() -> Result<Option<NestedCaptureShims>> {
 }
 
 fn create_nested_capture_shims() -> Result<NestedCaptureShims> {
-    let original_path = env::var_os("PATH").unwrap_or_default();
+    let original_path = env::var_os("RUNAWARE_SHIM_ORIGINAL_PATH")
+        .or_else(|| env::var_os("PATH"))
+        .unwrap_or_default();
     let runaware_bin =
         env::current_exe().context("failed to resolve current runaware executable")?;
     let dir = env::temp_dir().join(format!(
@@ -812,7 +814,7 @@ fn write_nested_capture_shim(path: &Path, command: &str, runaware_bin: &Path) ->
              if [ -z \"${{RUNAWARE_SHIM_ORIGINAL_PATH:-}}\" ]; then\n\
              \texec {command} \"$@\"\n\
              fi\n\
-             PATH=\"$RUNAWARE_SHIM_ORIGINAL_PATH\" RUNAWARE_DISABLE_SHIMS=1 exec {runaware} capture --source auto -- {command} \"$@\"\n",
+             PATH=\"$RUNAWARE_SHIM_ORIGINAL_PATH\" exec {runaware} capture --source auto -- {command} \"$@\"\n",
             command = shell_quote(command),
             runaware = shell_quote(&runaware_bin.display().to_string()),
         );
