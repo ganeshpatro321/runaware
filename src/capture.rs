@@ -5,8 +5,13 @@ use anyhow::{Context, Result, bail};
 #[cfg(unix)]
 use portable_pty::MasterPty;
 use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
+use std::env;
+use std::ffi::OsString;
+use std::fs;
 use std::io::{IsTerminal, Read, Write};
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{
@@ -21,6 +26,12 @@ struct OpenBlock {
     severity: Severity,
     title: String,
     lines: Vec<String>,
+}
+
+struct NestedCaptureShims {
+    dir: PathBuf,
+    original_path: OsString,
+    runaware_bin: PathBuf,
 }
 
 pub fn capture_command(
@@ -102,12 +113,15 @@ fn stdio_is_interactive() -> bool {
 fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String]) -> Result<i32> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(current_pty_size())?;
+    let shims = prepare_nested_capture_shims()?;
+    let executable = resolve_command_executable(&command[0], shims.as_ref());
 
-    let mut cmd = CommandBuilder::new(&command[0]);
+    let mut cmd = CommandBuilder::new(executable);
     cmd.args(&command[1..]);
     cmd.cwd(std::env::current_dir()?);
     cmd.env("RUNAWARE_CAPTURE_ACTIVE", "1");
     cmd.env("RUNAWARE_CAPTURE_SOURCE", source);
+    apply_nested_capture_shim_env_to_pty(&mut cmd, shims.as_ref())?;
 
     let mut child = pair
         .slave
@@ -410,10 +424,14 @@ fn capture_with_pipes(
     source: &str,
     command: &[String],
 ) -> Result<i32> {
-    let mut child = Command::new(&command[0])
-        .args(&command[1..])
+    let shims = prepare_nested_capture_shims()?;
+    let executable = resolve_command_executable(&command[0], shims.as_ref());
+    let mut cmd = Command::new(executable);
+    cmd.args(&command[1..])
         .env("RUNAWARE_CAPTURE_ACTIVE", "1")
-        .env("RUNAWARE_CAPTURE_SOURCE", source)
+        .env("RUNAWARE_CAPTURE_SOURCE", source);
+    apply_nested_capture_shim_env_to_command(&mut cmd, shims.as_ref())?;
+    let mut child = cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -680,7 +698,7 @@ fn infer_source(requested: &str, command: &[String], cwd: &Path) -> String {
 
     let text = command.join(" ").to_lowercase();
 
-    if is_package_manager_command(command) {
+    if is_package_context_command(command) {
         if let Some(package_name) = package_name_from_cwd(cwd) {
             return package_name;
         }
@@ -712,20 +730,24 @@ fn infer_source(requested: &str, command: &[String], cwd: &Path) -> String {
 }
 
 fn nested_capture_reuses_parent_source(source: &str) -> bool {
-    if std::env::var_os("RUNAWARE_CAPTURE_ACTIVE").is_none()
-        || std::env::var_os("RUNAWARE_ALLOW_NESTED").is_none()
+    if env::var_os("RUNAWARE_CAPTURE_ACTIVE").is_none()
+        || env::var_os("RUNAWARE_ALLOW_NESTED").is_none()
     {
         return false;
     }
 
-    std::env::var("RUNAWARE_CAPTURE_SOURCE").is_ok_and(|parent_source| parent_source == source)
+    env::var("RUNAWARE_CAPTURE_SOURCE").is_ok_and(|parent_source| parent_source == source)
 }
 
-fn is_package_manager_command(command: &[String]) -> bool {
+fn is_package_context_command(command: &[String]) -> bool {
     let Some(executable) = command.first().map(|value| value.as_str()) else {
         return false;
     };
-    matches!(executable, "npm" | "pnpm" | "yarn" | "bun")
+    let executable_name = executable.rsplit('/').next().unwrap_or(executable);
+    matches!(
+        executable_name,
+        "npm" | "pnpm" | "yarn" | "bun" | "node" | "python" | "python3" | "pytest" | "go" | "cargo"
+    )
 }
 
 fn package_name_from_cwd(cwd: &Path) -> Option<String> {
@@ -744,6 +766,126 @@ fn sanitize_source(value: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
         .collect::<String>()
         .to_lowercase()
+}
+
+fn prepare_nested_capture_shims() -> Result<Option<NestedCaptureShims>> {
+    if env::var_os("RUNAWARE_ALLOW_NESTED").is_none()
+        || env::var_os("RUNAWARE_DISABLE_SHIMS").is_some()
+    {
+        return Ok(None);
+    }
+    create_nested_capture_shims().map(Some)
+}
+
+fn create_nested_capture_shims() -> Result<NestedCaptureShims> {
+    let original_path = env::var_os("PATH").unwrap_or_default();
+    let runaware_bin =
+        env::current_exe().context("failed to resolve current runaware executable")?;
+    let dir = env::temp_dir().join(format!(
+        "runaware-shims-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create shim directory {}", dir.display()))?;
+
+    for command in NESTED_CAPTURE_SHIM_COMMANDS {
+        write_nested_capture_shim(&dir.join(command), command, &runaware_bin)?;
+    }
+
+    Ok(NestedCaptureShims {
+        dir,
+        original_path,
+        runaware_bin,
+    })
+}
+
+const NESTED_CAPTURE_SHIM_COMMANDS: &[&str] = &[
+    "npm", "pnpm", "yarn", "bun", "node", "python", "python3", "pytest", "go", "cargo", "docker",
+];
+
+fn write_nested_capture_shim(path: &Path, command: &str, runaware_bin: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ -z \"${{RUNAWARE_SHIM_ORIGINAL_PATH:-}}\" ]; then\n\
+             \texec {command} \"$@\"\n\
+             fi\n\
+             PATH=\"$RUNAWARE_SHIM_ORIGINAL_PATH\" RUNAWARE_DISABLE_SHIMS=1 exec {runaware} capture --source auto -- {command} \"$@\"\n",
+            command = shell_quote(command),
+            runaware = shell_quote(&runaware_bin.display().to_string()),
+        );
+        fs::write(path, script)
+            .with_context(|| format!("failed to write shim {}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to chmod shim {}", path.display()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, command, runaware_bin);
+        Ok(())
+    }
+}
+
+fn apply_nested_capture_shim_env_to_pty(
+    cmd: &mut CommandBuilder,
+    shims: Option<&NestedCaptureShims>,
+) -> Result<()> {
+    let Some(shims) = shims else {
+        return Ok(());
+    };
+    cmd.env("PATH", nested_capture_path(shims)?);
+    cmd.env("RUNAWARE_SHIM_ORIGINAL_PATH", &shims.original_path);
+    cmd.env("RUNAWARE_BIN", shims.runaware_bin.as_os_str());
+    Ok(())
+}
+
+fn apply_nested_capture_shim_env_to_command(
+    cmd: &mut Command,
+    shims: Option<&NestedCaptureShims>,
+) -> Result<()> {
+    let Some(shims) = shims else {
+        return Ok(());
+    };
+    cmd.env("PATH", nested_capture_path(shims)?);
+    cmd.env("RUNAWARE_SHIM_ORIGINAL_PATH", &shims.original_path);
+    cmd.env("RUNAWARE_BIN", shims.runaware_bin.as_os_str());
+    Ok(())
+}
+
+fn nested_capture_path(shims: &NestedCaptureShims) -> Result<OsString> {
+    let mut paths = Vec::with_capacity(1 + env::split_paths(&shims.original_path).count());
+    paths.push(shims.dir.clone());
+    paths.extend(env::split_paths(&shims.original_path));
+    env::join_paths(paths).context("failed to build nested capture PATH")
+}
+
+fn resolve_command_executable(command: &str, shims: Option<&NestedCaptureShims>) -> OsString {
+    if command.contains('/') {
+        return OsString::from(command);
+    }
+    let Some(shims) = shims else {
+        return OsString::from(command);
+    };
+    find_executable_on_path(command, &shims.original_path)
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| OsString::from(command))
+}
+
+fn find_executable_on_path(command: &str, path: &OsString) -> Option<PathBuf> {
+    for dir in env::split_paths(path) {
+        let candidate = dir.join(command);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -779,5 +921,26 @@ mod tests {
 
         assert!(!source.is_empty());
         assert_ne!(source, "pnpm");
+    }
+
+    #[test]
+    fn infers_package_name_for_node_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{ "name": "@acme/app-service" }"#,
+        )
+        .unwrap();
+
+        let source = infer_source(
+            "auto",
+            &[
+                "node".to_string(),
+                "scripts/workflow/run-local-dev.mjs".to_string(),
+            ],
+            dir.path(),
+        );
+
+        assert_eq!(source, "app-service");
     }
 }

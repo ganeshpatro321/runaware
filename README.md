@@ -274,7 +274,9 @@ For a specific command, opt into nested capture with:
 RUNAWARE_ALLOW_NESTED=1 runaware capture --source backend -- pnpm run dev
 ```
 
-Nested captures should use distinct source names. If a nested command resolves to the same source as its parent, RunAware runs that nested command without capture to keep the parent run intact.
+When nested capture is enabled, RunAware injects command shims into the captured process `PATH` so child package scripts started by tools such as Turbo can be captured even when they do not run through your interactive shell functions.
+
+Nested captures should use distinct source names. If a nested command resolves to the same source as its parent, RunAware runs that nested command without capture to keep the parent run intact. Package-scoped commands such as `node`, `pnpm`, and `npm` infer their source from the child package's `package.json` when available.
 
 ## Source Naming
 

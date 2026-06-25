@@ -4,6 +4,10 @@ All notable changes to RunAware will be documented in this file.
 
 This project follows semantic versioning after the initial public release.
 
+## 0.1.4 - 2026-06-25
+
+- Capture Turbo-style child package commands through opt-in nested PATH shims.
+
 ## 0.1.3 - 2026-06-25
 
 - Add opt-in nested shell capture with `RUNAWARE_ALLOW_NESTED=1`.
