@@ -337,6 +337,54 @@ impl Store {
         Ok(id)
     }
 
+    pub fn ensure_active_run(
+        &self,
+        source: &str,
+        command: &str,
+        cwd: &str,
+        pid: Option<u32>,
+    ) -> Result<String> {
+        let now = time::now().to_rfc3339();
+        if let Some((id, existing_pid)) = self.latest_open_run_for_source(source)? {
+            if existing_pid.is_none_or(process_is_alive) {
+                self.touch_source(source)?;
+                return Ok(id);
+            }
+        }
+
+        let command = redact::redact(command);
+        self.conn.execute(
+            r#"
+            INSERT INTO sources(name, first_seen_at, last_seen_at, run_count, last_command, last_cwd)
+            VALUES (?1, ?2, ?2, 1, ?3, ?4)
+            ON CONFLICT(name) DO UPDATE SET
+              last_seen_at = excluded.last_seen_at,
+              run_count = run_count + 1,
+              last_command = excluded.last_command,
+              last_cwd = excluded.last_cwd
+            "#,
+            params![source, now, command, cwd],
+        )?;
+
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO runs(id, source, command, cwd, started_at, pid) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, source, command, cwd, now, pid.map(|value| value as i64)],
+        )?;
+        Ok(id)
+    }
+
+    fn latest_open_run_for_source(&self, source: &str) -> Result<Option<(String, Option<i64>)>> {
+        self.conn
+            .query_row(
+                "SELECT id, pid FROM runs WHERE source = ?1 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1",
+                params![source],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn finish_run(&self, run_id: &str, exit_code: i32) -> Result<()> {
         let now = time::now().to_rfc3339();
         self.conn.execute(

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 #[cfg(unix)]
 use portable_pty::MasterPty;
 use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -34,6 +35,17 @@ struct NestedCaptureShims {
     runaware_bin: PathBuf,
 }
 
+struct CaptureOutcome {
+    code: i32,
+    virtual_run_ids: Vec<String>,
+}
+
+#[derive(Default)]
+struct LineCaptureState {
+    block: Option<OpenBlock>,
+    virtual_runs: HashMap<String, String>,
+}
+
 pub fn capture_command(
     store: &Store,
     requested_source: String,
@@ -47,7 +59,8 @@ pub fn capture_command(
     let command_text = command.join(" ");
     let cwd = std::env::current_dir()?.display().to_string();
     let source = infer_source(&requested_source, &command, Path::new(&cwd));
-    if nested_capture_reuses_parent_source(&source) {
+    if nested_capture_reuses_parent_source(&source) || nested_capture_should_skip_command(&command)
+    {
         return run_uncaptured(&command);
     }
     let run_id = match store.start_run(&source, &command_text, &cwd) {
@@ -66,11 +79,16 @@ pub fn capture_command(
     };
 
     match result {
-        Ok(code) => {
-            if let Err(err) = store.finish_run(&run_id, code) {
+        Ok(outcome) => {
+            if let Err(err) = store.finish_run(&run_id, outcome.code) {
                 eprintln!("RunAware failed to finish captured run: {err:#}");
             }
-            Ok(code)
+            for virtual_run_id in outcome.virtual_run_ids {
+                if let Err(err) = store.finish_run(&virtual_run_id, outcome.code) {
+                    eprintln!("RunAware failed to finish captured virtual run: {err:#}");
+                }
+            }
+            Ok(outcome.code)
         }
         Err(err) => {
             store.insert_error_block(
@@ -110,7 +128,12 @@ fn stdio_is_interactive() -> bool {
         && std::io::stderr().is_terminal()
 }
 
-fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String]) -> Result<i32> {
+fn capture_with_pty(
+    store: &Store,
+    run_id: &str,
+    source: &str,
+    command: &[String],
+) -> Result<CaptureOutcome> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(current_pty_size())?;
     let shims = prepare_nested_capture_shims()?;
@@ -127,7 +150,8 @@ fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String
         .slave
         .spawn_command(cmd)
         .with_context(|| format!("failed to spawn '{}'", command.join(" ")))?;
-    if let Some(pid) = child.process_id() {
+    let child_pid = child.process_id();
+    if let Some(pid) = child_pid {
         store.set_run_pid(run_id, pid)?;
     }
     let interrupt = InterruptGuard::install(child.process_id(), true, child.clone_killer())?;
@@ -148,7 +172,7 @@ fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String
     let mut stdout = std::io::stdout();
     let mut buffer = [0_u8; 8192];
     let mut partial = String::new();
-    let mut block: Option<OpenBlock> = None;
+    let mut state = LineCaptureState::default();
 
     loop {
         let n = reader.read(&mut buffer)?;
@@ -160,19 +184,33 @@ fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String
 
         let text = String::from_utf8_lossy(&buffer[..n]);
         partial.push_str(&text);
-        flush_complete_lines(store, run_id, source, "pty", &mut partial, &mut block)?;
+        flush_complete_lines(
+            store,
+            run_id,
+            source,
+            "pty",
+            &mut partial,
+            &mut state,
+            child_pid,
+        )?;
     }
 
     if !partial.is_empty() {
-        process_line(store, run_id, source, "pty", &partial, &mut block)?;
+        process_line(
+            store, run_id, source, "pty", &partial, &mut state, child_pid,
+        )?;
     }
-    flush_block(store, run_id, source, &mut block)?;
+    flush_block(store, run_id, source, &mut state.block)?;
 
     let status = child.wait()?;
-    Ok(if interrupt.was_triggered() {
+    let code = if interrupt.was_triggered() {
         130
     } else {
         status.exit_code() as i32
+    };
+    Ok(CaptureOutcome {
+        code,
+        virtual_run_ids: state.virtual_runs.into_values().collect(),
     })
 }
 
@@ -423,7 +461,7 @@ fn capture_with_pipes(
     run_id: &str,
     source: &str,
     command: &[String],
-) -> Result<i32> {
+) -> Result<CaptureOutcome> {
     let shims = prepare_nested_capture_shims()?;
     let executable = resolve_command_executable(&command[0], shims.as_ref());
     let mut cmd = Command::new(executable);
@@ -437,8 +475,9 @@ fn capture_with_pipes(
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn '{}'", command.join(" ")))?;
-    store.set_run_pid(run_id, child.id())?;
-    let interrupt = InterruptGuard::install(Some(child.id()), false, child.clone_killer())?;
+    let child_pid = child.id();
+    store.set_run_pid(run_id, child_pid)?;
+    let interrupt = InterruptGuard::install(Some(child_pid), false, child.clone_killer())?;
 
     let (tx, rx) = mpsc::channel();
     let mut readers = Vec::new();
@@ -450,7 +489,7 @@ fn capture_with_pipes(
     }
     drop(tx);
 
-    let mut block = None;
+    let mut state = LineCaptureState::default();
     let mut stdout_partial = String::new();
     let mut stderr_partial = String::new();
     for event in rx {
@@ -467,7 +506,8 @@ fn capture_with_pipes(
                     } else {
                         &mut stdout_partial
                     },
-                    &mut block,
+                    &mut state,
+                    Some(child_pid),
                 )?;
             }
             PipeEvent::ReadError { stream, error } => {
@@ -481,18 +521,38 @@ fn capture_with_pipes(
     }
 
     if !stdout_partial.is_empty() {
-        process_line(store, run_id, source, "stdout", &stdout_partial, &mut block)?;
+        process_line(
+            store,
+            run_id,
+            source,
+            "stdout",
+            &stdout_partial,
+            &mut state,
+            Some(child_pid),
+        )?;
     }
     if !stderr_partial.is_empty() {
-        process_line(store, run_id, source, "stderr", &stderr_partial, &mut block)?;
+        process_line(
+            store,
+            run_id,
+            source,
+            "stderr",
+            &stderr_partial,
+            &mut state,
+            Some(child_pid),
+        )?;
     }
-    flush_block(store, run_id, source, &mut block)?;
+    flush_block(store, run_id, source, &mut state.block)?;
 
     let status = child.wait()?;
-    Ok(if interrupt.was_triggered() {
+    let code = if interrupt.was_triggered() {
         130
     } else {
         status.code().unwrap_or(1)
+    };
+    Ok(CaptureOutcome {
+        code,
+        virtual_run_ids: state.virtual_runs.into_values().collect(),
     })
 }
 
@@ -548,7 +608,8 @@ fn process_pipe_chunk(
     stream: &str,
     bytes: &[u8],
     partial: &mut String,
-    block: &mut Option<OpenBlock>,
+    state: &mut LineCaptureState,
+    pid: Option<u32>,
 ) -> Result<()> {
     if stream == "stderr" {
         std::io::stderr().write_all(bytes)?;
@@ -559,7 +620,7 @@ fn process_pipe_chunk(
     }
     let text = String::from_utf8_lossy(bytes);
     partial.push_str(&text);
-    flush_complete_lines(store, run_id, source, stream, partial, block)
+    flush_complete_lines(store, run_id, source, stream, partial, state, pid)
 }
 
 struct InterruptGuard {
@@ -623,14 +684,15 @@ fn flush_complete_lines(
     source: &str,
     stream: &str,
     partial: &mut String,
-    block: &mut Option<OpenBlock>,
+    state: &mut LineCaptureState,
+    pid: Option<u32>,
 ) -> Result<()> {
     while let Some(pos) = partial.find('\n') {
         let mut line = partial[..pos].to_string();
         if line.ends_with('\r') {
             line.pop();
         }
-        process_line(store, run_id, source, stream, &line, block)?;
+        process_line(store, run_id, source, stream, &line, state, pid)?;
         *partial = partial[pos + 1..].to_string();
     }
     Ok(())
@@ -642,34 +704,75 @@ fn process_line(
     source: &str,
     stream: &str,
     raw_line: &str,
-    block: &mut Option<OpenBlock>,
+    state: &mut LineCaptureState,
+    pid: Option<u32>,
 ) -> Result<()> {
     let line = redact::redact(raw_line);
     let level = detect::classify_line(&line);
     let tags = detect::tags_for(&line);
     store.insert_log(run_id, source, stream, level, &line, &tags)?;
 
-    if let Some(open) = block.as_mut() {
+    if let Some((turbo_source, turbo_message)) = parse_turbo_task_line(&line) {
+        let virtual_run_id = if let Some(existing) = state.virtual_runs.get(&turbo_source) {
+            existing.clone()
+        } else {
+            let id = store.ensure_active_run(
+                &turbo_source,
+                &format!("turbo task output from {source}"),
+                &std::env::current_dir()?.display().to_string(),
+                pid,
+            )?;
+            state.virtual_runs.insert(turbo_source.clone(), id.clone());
+            id
+        };
+        let turbo_level = detect::classify_line(&turbo_message);
+        let turbo_tags = detect::tags_for(&turbo_message);
+        store.insert_log(
+            &virtual_run_id,
+            &turbo_source,
+            stream,
+            turbo_level,
+            &turbo_message,
+            &turbo_tags,
+        )?;
+    }
+
+    if let Some(open) = state.block.as_mut() {
         if detect::is_continuation(&line) {
             open.lines.push(line);
             return Ok(());
         }
-        flush_block(store, run_id, source, block)?;
+        flush_block(store, run_id, source, &mut state.block)?;
     }
 
     if let Some(DetectedStart { severity, title }) = detect::detect_start(&line) {
         let single_line_warning = severity == Severity::Warning && !line.contains("warning:");
-        *block = Some(OpenBlock {
+        state.block = Some(OpenBlock {
             severity,
             title,
             lines: vec![line],
         });
         if single_line_warning {
-            flush_block(store, run_id, source, block)?;
+            flush_block(store, run_id, source, &mut state.block)?;
         }
     }
 
     Ok(())
+}
+
+fn parse_turbo_task_line(line: &str) -> Option<(String, String)> {
+    let (package, rest) = line.split_once(':')?;
+    let package = package.trim();
+    if package.is_empty() || package.contains(' ') {
+        return None;
+    }
+    let (_task, message) = rest.split_once(':')?;
+    let source_name = package.rsplit('/').next().unwrap_or(package);
+    let source = sanitize_source(source_name);
+    if source.is_empty() {
+        return None;
+    }
+    Some((source, message.trim_start().to_string()))
 }
 
 fn flush_block(
@@ -737,6 +840,27 @@ fn nested_capture_reuses_parent_source(source: &str) -> bool {
     }
 
     env::var("RUNAWARE_CAPTURE_SOURCE").is_ok_and(|parent_source| parent_source == source)
+}
+
+fn nested_capture_should_skip_command(command: &[String]) -> bool {
+    if env::var_os("RUNAWARE_CAPTURE_ACTIVE").is_none()
+        || env::var_os("RUNAWARE_ALLOW_NESTED").is_none()
+    {
+        return false;
+    }
+    let Some(executable) = command
+        .first()
+        .map(|value| value.rsplit('/').next().unwrap_or(value))
+    else {
+        return false;
+    };
+    if executable != "node" {
+        return false;
+    }
+    command.iter().skip(1).any(|arg| {
+        let normalized = arg.replace('\\', "/");
+        normalized.ends_with("/pnpm.cjs") || normalized.ends_with("/turbo/bin/turbo")
+    })
 }
 
 fn is_package_context_command(command: &[String]) -> bool {
@@ -892,7 +1016,7 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::infer_source;
+    use super::{infer_source, parse_turbo_task_line};
 
     #[test]
     fn infers_package_name_for_package_manager_commands() {
@@ -944,5 +1068,15 @@ mod tests {
         );
 
         assert_eq!(source, "app-service");
+    }
+
+    #[test]
+    fn parses_turbo_task_output_prefix() {
+        let parsed = parse_turbo_task_line("@fixture/agent-platform:dev: server ready");
+
+        assert_eq!(
+            parsed,
+            Some(("agent-platform".to_string(), "server ready".to_string())),
+        );
     }
 }
