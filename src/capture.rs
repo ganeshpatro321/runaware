@@ -36,6 +36,9 @@ pub fn capture_command(
     let command_text = command.join(" ");
     let cwd = std::env::current_dir()?.display().to_string();
     let source = infer_source(&requested_source, &command, Path::new(&cwd));
+    if nested_capture_reuses_parent_source(&source) {
+        return run_uncaptured(&command);
+    }
     let run_id = match store.start_run(&source, &command_text, &cwd) {
         Ok(run_id) => run_id,
         Err(err) => {
@@ -104,6 +107,7 @@ fn capture_with_pty(store: &Store, run_id: &str, source: &str, command: &[String
     cmd.args(&command[1..]);
     cmd.cwd(std::env::current_dir()?);
     cmd.env("RUNAWARE_CAPTURE_ACTIVE", "1");
+    cmd.env("RUNAWARE_CAPTURE_SOURCE", source);
 
     let mut child = pair
         .slave
@@ -409,6 +413,7 @@ fn capture_with_pipes(
     let mut child = Command::new(&command[0])
         .args(&command[1..])
         .env("RUNAWARE_CAPTURE_ACTIVE", "1")
+        .env("RUNAWARE_CAPTURE_SOURCE", source)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -704,6 +709,16 @@ fn infer_source(requested: &str, command: &[String], cwd: &Path) -> String {
             .map(|value| sanitize_source(value))
             .unwrap_or_else(|| "process".to_string())
     }
+}
+
+fn nested_capture_reuses_parent_source(source: &str) -> bool {
+    if std::env::var_os("RUNAWARE_CAPTURE_ACTIVE").is_none()
+        || std::env::var_os("RUNAWARE_ALLOW_NESTED").is_none()
+    {
+        return false;
+    }
+
+    std::env::var("RUNAWARE_CAPTURE_SOURCE").is_ok_and(|parent_source| parent_source == source)
 }
 
 fn is_package_manager_command(command: &[String]) -> bool {

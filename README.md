@@ -264,6 +264,18 @@ runaware capture --source tests -- cargo test
 RunAware mirrors the command output to your terminal while storing redacted runtime context locally.
 Interactive terminal commands use PTY capture. Commands whose stdin, stdout, or stderr is piped or redirected automatically use pipe capture so shell pipelines and redirects keep normal stream behavior.
 
+### Nested Capture
+
+RunAware skips nested shell-integration captures by default. This avoids duplicate logs and prevents child commands from replacing the parent command's active source.
+
+For a specific command, opt into nested capture with:
+
+```bash
+RUNAWARE_ALLOW_NESTED=1 runaware capture --source backend -- pnpm run dev
+```
+
+Nested captures should use distinct source names. If a nested command resolves to the same source as its parent, RunAware runs that nested command without capture to keep the parent run intact.
+
 ## Source Naming
 
 For package-manager commands such as `pnpm`, `npm`, `yarn`, and `bun`, RunAware infers the source from:

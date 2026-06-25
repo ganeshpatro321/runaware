@@ -4,6 +4,10 @@ All notable changes to RunAware will be documented in this file.
 
 This project follows semantic versioning after the initial public release.
 
+## 0.1.3 - 2026-06-25
+
+- Add opt-in nested shell capture with `RUNAWARE_ALLOW_NESTED=1`.
+
 ## 0.1.2 - 2026-06-04
 
 - Forward terminal stdin to PTY-backed captured commands so interactive TUIs receive keypresses.

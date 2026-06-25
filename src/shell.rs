@@ -17,7 +17,7 @@ const POSIX_SCRIPT: &str = r#"# RunAware shell integration
 __runaware_capture() {
   local __runaware_cmd="$1"
   shift
-  if [ -n "${RUNAWARE_CAPTURE_ACTIVE:-}" ]; then
+  if [ -n "${RUNAWARE_CAPTURE_ACTIVE:-}" ] && [ -z "${RUNAWARE_ALLOW_NESTED:-}" ]; then
     command "$__runaware_cmd" "$@"
     return $?
   fi
@@ -46,7 +46,7 @@ go() { __runaware_capture go "$@"; }
 cargo() { __runaware_capture cargo "$@"; }
 
 docker() {
-  if [ -n "${RUNAWARE_CAPTURE_ACTIVE:-}" ]; then
+  if [ -n "${RUNAWARE_CAPTURE_ACTIVE:-}" ] && [ -z "${RUNAWARE_ALLOW_NESTED:-}" ]; then
     command docker "$@"
     return $?
   fi
@@ -70,7 +70,7 @@ const FISH_SCRIPT: &str = r#"# RunAware shell integration for fish
 function __runaware_capture
   set cmd $argv[1]
   set -e argv[1]
-  if set -q RUNAWARE_CAPTURE_ACTIVE
+  if set -q RUNAWARE_CAPTURE_ACTIVE; and not set -q RUNAWARE_ALLOW_NESTED
     command $cmd $argv
     return $status
   end
@@ -97,7 +97,7 @@ function pytest; __runaware_capture pytest $argv; end
 function go; __runaware_capture go $argv; end
 function cargo; __runaware_capture cargo $argv; end
 function docker
-  if set -q RUNAWARE_CAPTURE_ACTIVE
+  if set -q RUNAWARE_CAPTURE_ACTIVE; and not set -q RUNAWARE_ALLOW_NESTED
     command docker $argv
     return $status
   end
@@ -124,13 +124,15 @@ mod tests {
     use crate::cli::ShellKind;
 
     #[test]
-    fn shell_integration_skips_nested_capture() {
+    fn shell_integration_skips_nested_capture_by_default() {
         let zsh = init_script(ShellKind::Zsh);
         assert!(zsh.contains("RUNAWARE_CAPTURE_ACTIVE"));
+        assert!(zsh.contains("RUNAWARE_ALLOW_NESTED"));
         assert!(zsh.contains("command \"$__runaware_cmd\" \"$@\""));
 
         let fish = init_script(ShellKind::Fish);
         assert!(fish.contains("RUNAWARE_CAPTURE_ACTIVE"));
+        assert!(fish.contains("RUNAWARE_ALLOW_NESTED"));
         assert!(fish.contains("command $cmd $argv"));
     }
 }
