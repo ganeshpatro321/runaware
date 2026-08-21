@@ -6,7 +6,10 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 use uuid::Uuid;
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct Store {
@@ -88,6 +91,14 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -96,9 +107,6 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
-
             CREATE TABLE IF NOT EXISTS sources (
               name TEXT PRIMARY KEY,
               first_seen_at TEXT NOT NULL,
@@ -315,7 +323,6 @@ impl Store {
     pub fn start_run(&self, source: &str, command: &str, cwd: &str) -> Result<String> {
         let now = time::now().to_rfc3339();
         let command = redact::redact(command);
-        self.clear_source_runtime_data(source)?;
         self.conn.execute(
             r#"
             INSERT INTO sources(name, first_seen_at, last_seen_at, run_count, last_command, last_cwd)
@@ -666,25 +673,6 @@ impl Store {
         Ok(matches!(value, Some((None, Some(pid))) if process_is_alive(pid)))
     }
 
-    fn clear_source_runtime_data(&self, source: &str) -> Result<()> {
-        let run_ids = self.run_ids_for_source(source)?;
-        for run_id in run_ids {
-            self.conn.execute(
-                "DELETE FROM log_fts WHERE event_id IN (SELECT id FROM log_events WHERE run_id = ?1)",
-                params![run_id],
-            )?;
-            self.conn.execute(
-                "DELETE FROM error_blocks WHERE run_id = ?1",
-                params![run_id],
-            )?;
-            self.conn
-                .execute("DELETE FROM log_events WHERE run_id = ?1", params![run_id])?;
-            self.conn
-                .execute("DELETE FROM runs WHERE id = ?1", params![run_id])?;
-        }
-        Ok(())
-    }
-
     pub fn create_checkpoint(&self, name: &str) -> Result<Checkpoint> {
         let checkpoint = Checkpoint {
             id: Uuid::new_v4().to_string(),
@@ -974,9 +962,10 @@ mod tests {
     }
 
     #[test]
-    fn new_run_clears_previous_runtime_data_for_source() {
+    fn new_run_preserves_existing_live_run_for_source() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let path = dir.path().join("test.db");
+        let store = Store::open(path.clone()).unwrap();
 
         let first_run = store.start_run("api", "pnpm run dev", "/tmp/api").unwrap();
         store.set_run_pid(&first_run, std::process::id()).unwrap();
@@ -993,7 +982,10 @@ mod tests {
             )
             .unwrap();
 
-        let second_run = store.start_run("api", "pnpm run dev", "/tmp/api").unwrap();
+        let second_store = Store::open(path).unwrap();
+        let second_run = second_store
+            .start_run("api", "pnpm run dev", "/tmp/api")
+            .unwrap();
         store.set_run_pid(&second_run, std::process::id()).unwrap();
         store
             .insert_log(
@@ -1015,6 +1007,17 @@ mod tests {
             )
             .unwrap();
 
+        store
+            .insert_log(
+                &first_run,
+                "api",
+                "pty",
+                LogLevel::Info,
+                "first run still alive",
+                &[],
+            )
+            .unwrap();
+
         let errors = store
             .error_blocks_since(
                 Utc::now() - chrono::Duration::minutes(1),
@@ -1023,8 +1026,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].title, "Error: new");
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|error| error.title == "Error: old"));
+        assert!(errors.iter().any(|error| error.title == "Error: new"));
 
         let old_search = store
             .search_logs(
@@ -1035,7 +1039,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert!(old_search.is_empty());
+        assert_eq!(old_search.len(), 1);
 
         store.finish_run(&second_run, 0).unwrap();
         let stopped_errors = store
@@ -1046,6 +1050,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert!(stopped_errors.is_empty());
+        assert_eq!(stopped_errors.len(), 1);
+        assert_eq!(stopped_errors[0].title, "Error: old");
     }
 }

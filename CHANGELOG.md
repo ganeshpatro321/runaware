@@ -4,6 +4,12 @@ All notable changes to RunAware will be documented in this file.
 
 This project follows semantic versioning after the initial public release.
 
+## 0.1.7 - 2026-08-21
+
+- Preserve existing live runs when another capture starts with the same source.
+- Add SQLite busy timeout and connection pragmas to reduce lock failures under concurrent captures.
+- Keep captured commands running if RunAware storage fails during log persistence.
+
 ## 0.1.6 - 2026-06-25
 
 - Split Turbo task output into package-specific virtual sources.

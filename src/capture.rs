@@ -44,6 +44,7 @@ struct CaptureOutcome {
 struct LineCaptureState {
     block: Option<OpenBlock>,
     virtual_runs: HashMap<String, String>,
+    storage_failed: bool,
 }
 
 pub fn capture_command(
@@ -91,13 +92,15 @@ pub fn capture_command(
             Ok(outcome.code)
         }
         Err(err) => {
-            store.insert_error_block(
+            if let Err(store_err) = store.insert_error_block(
                 &run_id,
                 &source,
                 Severity::Fatal,
                 "RunAware capture failed",
                 &redact::redact(&err.to_string()),
-            )?;
+            ) {
+                eprintln!("RunAware failed to record capture error: {store_err:#}");
+            }
             if let Err(finish_err) = store.finish_run(&run_id, 1) {
                 eprintln!("RunAware failed to finish failed captured run: {finish_err:#}");
             }
@@ -710,31 +713,49 @@ fn process_line(
     let line = redact::redact(raw_line);
     let level = detect::classify_line(&line);
     let tags = detect::tags_for(&line);
-    store.insert_log(run_id, source, stream, level, &line, &tags)?;
+    if state.storage_failed {
+        return Ok(());
+    }
+    if let Err(err) = store.insert_log(run_id, source, stream, level, &line, &tags) {
+        state.storage_failed = true;
+        eprintln!("RunAware capture storage disabled for this run: {err:#}");
+        return Ok(());
+    }
 
     if let Some((turbo_source, turbo_message)) = parse_turbo_task_line(&line) {
         let virtual_run_id = if let Some(existing) = state.virtual_runs.get(&turbo_source) {
             existing.clone()
         } else {
-            let id = store.ensure_active_run(
+            let id = match store.ensure_active_run(
                 &turbo_source,
                 &format!("turbo task output from {source}"),
                 &std::env::current_dir()?.display().to_string(),
                 pid,
-            )?;
+            ) {
+                Ok(id) => id,
+                Err(err) => {
+                    state.storage_failed = true;
+                    eprintln!("RunAware capture storage disabled for this run: {err:#}");
+                    return Ok(());
+                }
+            };
             state.virtual_runs.insert(turbo_source.clone(), id.clone());
             id
         };
         let turbo_level = detect::classify_line(&turbo_message);
         let turbo_tags = detect::tags_for(&turbo_message);
-        store.insert_log(
+        if let Err(err) = store.insert_log(
             &virtual_run_id,
             &turbo_source,
             stream,
             turbo_level,
             &turbo_message,
             &turbo_tags,
-        )?;
+        ) {
+            state.storage_failed = true;
+            eprintln!("RunAware capture storage disabled for this run: {err:#}");
+            return Ok(());
+        }
     }
 
     if let Some(open) = state.block.as_mut() {
@@ -783,7 +804,11 @@ fn flush_block(
 ) -> Result<()> {
     if let Some(open) = block.take() {
         let body = open.lines.join("\n");
-        store.insert_error_block(run_id, source, open.severity, &open.title, &body)?;
+        if let Err(err) =
+            store.insert_error_block(run_id, source, open.severity, &open.title, &body)
+        {
+            eprintln!("RunAware failed to record error block: {err:#}");
+        }
     }
     Ok(())
 }
